@@ -1,5 +1,6 @@
 requests
 Flask
 pydantic
-openai
 kubernetes
+openai
+python-dotenv
