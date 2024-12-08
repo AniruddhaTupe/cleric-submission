@@ -1,8 +1,9 @@
 import logging
 import os
 import subprocess
+from typing import Optional
 from flask import Flask, request, jsonify
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -20,26 +21,50 @@ app = Flask(__name__)
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
+# Define kubectl commands list
+KUBECTL_COMMANDS = [
+    "kubectl cluster-info",
+    "kubectl get nodes -o wide",
+    "kubectl describe nodes",
+    "kubectl get namespaces",
+    "kubectl get all --all-namespaces -o wide",
+    "kubectl describe all --all-namespaces",
+    "kubectl get configmaps --all-namespaces -o wide",
+    "kubectl get secrets --all-namespaces -o wide",
+    "kubectl get networkpolicies --all-namespaces",
+    "kubectl get resourcequotas --all-namespaces",
+    "kubectl get limitranges --all-namespaces",
+    "kubectl get pv -o wide",
+    "kubectl get pvc --all-namespaces -o wide",
+    "kubectl get events --all-namespaces",
+    "kubectl get svc --all-namespaces -o wide",
+    "kubectl get ingress --all-namespaces -o wide",
+    "kubectl get endpoints --all-namespaces",
+    "kubectl get crd",
+    "kubectl get config",
+    "kubectl top nodes",
+    "kubectl top pods --all-namespaces",
+    "kubectl api-resources -o wide",
+    "kubectl api-versions",
+]
+
 class QueryResponse(BaseModel):
     query: str
     answer: str
 
-def get_kubectl_command(query):
-    """Translate natural language query to kubectl command using GPT-4"""
+def get_appropriate_command(query: str) -> str:
+    """Get the appropriate kubectl command for the query"""
     try:
-        system_prompt = """You are a Kubernetes expert. Convert the user's natural language query into 
-        the appropriate kubectl command. Only return the exact command without any explanation or additional text. 
-        The command should be read-only (no modifications to the cluster). Examples:
-        - "How many pods are running?" -> "kubectl get pods --all-namespaces"
-        - "What's the status of deployment nginx?" -> "kubectl get deployment nginx -o wide"
-        - "Show me all nodes" -> "kubectl get nodes"
-        """
+        system_prompt = """You are a Kubernetes expert. Given a user query and a list of available kubectl commands, 
+        either select the most appropriate command from the list or generate a new kubectl command if none fit. 
+        Only return the exact command without any explanation. The command must be read-only (no modifications to the cluster).
+        If multiple commands could work, choose the most specific one."""
 
         response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": query}
+                {"role": "user", "content": f"Available commands:\n{chr(10).join(KUBECTL_COMMANDS)}\n\nQuery: {query}"}
             ],
             temperature=0,
             max_tokens=100
@@ -47,13 +72,12 @@ def get_kubectl_command(query):
         
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logging.error(f"Error generating kubectl command: {str(e)}")
+        logging.error(f"Error getting appropriate command: {str(e)}")
         raise
 
-def execute_kubectl_command(command):
-    """Execute the kubectl command and return the output"""
+def execute_kubectl_command(command: str) -> tuple[str, Optional[str]]:
+    """Execute a kubectl command and return output and error"""
     try:
-        # Remove any surrounding quotes that might cause issues
         command = command.strip('"\'')
         result = subprocess.run(
             command.split(),
@@ -61,76 +85,68 @@ def execute_kubectl_command(command):
             text=True,
             check=False
         )
-        if result.returncode != 0:
-            raise Exception(f"Command failed: {result.stderr}")
-        return result.stdout.strip()
+        
+        return result.stdout.strip(), result.stderr if result.returncode != 0 else None
     except Exception as e:
         logging.error(f"Error executing kubectl command: {str(e)}")
-        raise
+        return "", str(e)
 
-def format_response(query, command_output):
-    """Format the kubectl output into a user-friendly response using GPT-4"""
+def process_output(query: str, command: str, output: str) -> str:
+    """Process command output using GPT-4"""
     try:
-        system_prompt = """You are a Kubernetes cluster assistant. Format the provided command output 
-        into a clear, concise answer. Remove any technical identifiers (use 'mongodb' instead of 
-        'mongodb-56c598c8fc'). Only return the direct answer without any explanations. 
-        Follow these guidelines:
-        1. Only use the information provided in the cluster_info
-        2. Keep the answers very short and precise. Give only one-word answers wherever possible.
-        3. If the exact information is not available, return "Not found" or "0" as appropriate
-        4. Focus on read-only information retrieval
-        5. Prioritize direct, factual responses
-        6. When listing single items, return just the name without brackets or quotes
-        7. Only use list format when there are multiple items to display
-        8. Return numbers directly without any prefix or labels
-        9. Do not include words like "Answer:" or similar prefixes in your response
-        """
+        system_prompt = """You are a Kubernetes cluster assistant. Format the command output into a clear, 
+        concise answer to the user's query. Keep answers factual and to the point. Only give the required answer in 1 or 2 words.
+        Don't use sentence structure.
+        No need to write explanatory response. If the output indicates 
+        an error or doesn't contain relevant information, respond with "Information not available"."""
 
         response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Query: {query}\nCommand output: {command_output}"}
+                {"role": "user", "content": f"Query: {query}\nCommand: {command}\nOutput: {output}"}
             ],
             temperature=0,
-            max_tokens=100
+            max_tokens=150
         )
         
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logging.error(f"Error formatting response: {str(e)}")
+        logging.error(f"Error processing output: {str(e)}")
         raise
 
 @app.route('/query', methods=['POST'])
-def create_query():
+def query_cluster():
+    """Process a query about the cluster"""
     try:
-        # Extract the question from the request data
         request_data = request.json
         query = request_data.get('query')
         
-        # Log the question
-        logging.info(f"Received query: {query}")
+        if not query:
+            return jsonify({"error": "Query is required"}), 400
+
+        logging.info(f"Processing query: {query}")
         
-        # Get kubectl command
-        kubectl_command = get_kubectl_command(query)
-        logging.info(f"Generated kubectl command: {kubectl_command}")
+        # Get appropriate command for the query
+        command = get_appropriate_command(query)
+        logging.info(f"Selected command: {command}")
         
-        # Execute kubectl command
-        command_output = execute_kubectl_command(kubectl_command)
-        logging.info(f"Command output: {command_output}")
+        # Execute the command
+        output, error = execute_kubectl_command(command)
+        if error:
+            logging.error(f"Command execution error: {error}")
+            return jsonify({"error": f"Command execution failed: {error}"}), 500
+            
+        # Process the output
+        answer = process_output(query, command, output)
         
-        # Format the response
-        answer = format_response(query, command_output)
-        logging.info(f"Generated answer: {answer}")
-        
-        # Create the response model
-        response = QueryResponse(query=query, answer=answer)
-        
+        response = QueryResponse(
+            query=query,
+            answer=answer,
+            command_used=command
+        )
         return jsonify(response.dict())
     
-    except ValidationError as e:
-        logging.error(f"Validation error: {str(e)}")
-        return jsonify({"error": e.errors()}), 400
     except Exception as e:
         logging.error(f"Unexpected error: {str(e)}")
         return jsonify({"error": str(e)}), 500
