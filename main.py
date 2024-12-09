@@ -1,11 +1,15 @@
 import logging
 import os
-import subprocess
-from typing import Optional
+from typing import Optional, Dict, Any
 from flask import Flask, request, jsonify
 from pydantic import BaseModel
 from openai import OpenAI
 from dotenv import load_dotenv
+from kubernetes import client, config
+import json
+import random
+import time
+import openai
 
 # Load environment variables
 load_dotenv()
@@ -21,98 +25,136 @@ app = Flask(__name__)
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
-# Define kubectl commands list
-KUBECTL_COMMANDS = [
-    "kubectl cluster-info",
-    "kubectl get nodes -o wide",
-    "kubectl describe nodes",
-    "kubectl get namespaces",
-    "kubectl get all --all-namespaces -o wide",
-    "kubectl describe all --all-namespaces",
-    "kubectl get configmaps --all-namespaces -o wide",
-    "kubectl get secrets --all-namespaces -o wide",
-    "kubectl get networkpolicies --all-namespaces",
-    "kubectl get resourcequotas --all-namespaces",
-    "kubectl get limitranges --all-namespaces",
-    "kubectl get pv -o wide",
-    "kubectl get pvc --all-namespaces -o wide",
-    "kubectl get events --all-namespaces",
-    "kubectl get svc --all-namespaces -o wide",
-    "kubectl get ingress --all-namespaces -o wide",
-    "kubectl get endpoints --all-namespaces",
-    "kubectl get crd",
-    "kubectl get config",
-    "kubectl top nodes",
-    "kubectl top pods --all-namespaces",
-    "kubectl api-resources -o wide",
-    "kubectl api-versions",
-]
+# Initialize Kubernetes client
+try:
+    config.load_incluster_config()  # Try to load in-cluster config
+except config.ConfigException:
+    config.load_kube_config()  # Fall back to local kube config
+
+# Create API clients
+v1 = client.CoreV1Api()
+apps_v1 = client.AppsV1Api()
+custom_objects = client.CustomObjectsApi()
+
+# Define available Kubernetes API endpoints
+K8S_ENDPOINTS = {
+    "list_node": "Get information about all nodes",
+    "list_namespace": "Get all namespaces",
+    "list_pod_for_all_namespaces": "Get all pods across namespaces",
+    "list_service_for_all_namespaces": "Get all services",
+    "list_deployment_for_all_namespaces": "Get all deployments",
+    "list_persistent_volume": "Get all persistent volumes",
+    "list_persistent_volume_claim_for_all_namespaces": "Get all PVCs",
+    "list_config_map_for_all_namespaces": "Get all config maps",
+    "list_secret_for_all_namespaces": "Get all secrets",
+    "list_service_account_for_all_namespaces": "Get all service accounts",
+    "list_endpoints_for_all_namespaces": "Get all endpoints",
+}
 
 class QueryResponse(BaseModel):
     query: str
     answer: str
 
-def get_appropriate_command(query: str) -> str:
-    """Get the appropriate kubectl command for the query"""
+def get_appropriate_endpoint(query: str) -> str:
+    """Get the appropriate K8s API endpoint for the query"""
     try:
-        system_prompt = """You are a Kubernetes expert. Given a user query and a list of available kubectl commands, 
-        either select the most appropriate command from the list or generate a new kubectl command if none fit. 
-        Only return the exact command without any explanation. The command must be read-only (no modifications to the cluster).
-        If multiple commands could work, choose the most specific one."""
+        system_prompt = """You are a Kubernetes API expert. Given a user query and available API endpoints, 
+        select the most appropriate endpoint. Only return the exact endpoint name without any explanation. 
+        If no endpoint fits, respond with "not_available"."""
 
         response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Available commands:\n{chr(10).join(KUBECTL_COMMANDS)}\n\nQuery: {query}"}
+                {"role": "user", "content": f"Available endpoints:\n{json.dumps(K8S_ENDPOINTS, indent=2)}\n\nQuery: {query}"}
             ],
             temperature=0,
-            max_tokens=100
+            max_tokens=50
         )
         
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logging.error(f"Error getting appropriate command: {str(e)}")
+        logging.error(f"Error getting appropriate endpoint: {str(e)}")
         raise
 
-def execute_kubectl_command(command: str) -> tuple[str, Optional[str]]:
-    """Execute a kubectl command and return output and error"""
+def call_k8s_api(endpoint: str) -> Dict[str, Any]:
+    """Call Kubernetes API endpoint"""
     try:
-        command = command.strip('"\'')
-        result = subprocess.run(
-            command.split(),
-            capture_output=True,
-            text=True,
-            check=False
-        )
-        
-        return result.stdout.strip(), result.stderr if result.returncode != 0 else None
-    except Exception as e:
-        logging.error(f"Error executing kubectl command: {str(e)}")
-        return "", str(e)
+        # Get the appropriate API client
+        if endpoint.startswith("list_deployment"):
+            api_client = apps_v1
+        else:
+            api_client = v1
 
-def process_output(query: str, command: str, output: str) -> str:
-    """Process command output using GPT-4"""
+        # Call the endpoint
+        api_func = getattr(api_client, endpoint)
+        response = api_func()
+        
+        # Convert response to dict
+        return client.ApiClient().sanitize_for_serialization(response)
+    except Exception as e:
+        logging.error(f"Error calling K8s API: {str(e)}")
+        raise
+
+def filter_api_response(endpoint: str, response: Dict[str, Any], query: str) -> Dict[str, Any]:
+    """Filter the API response to include only relevant data"""
     try:
-        system_prompt = """You are a Kubernetes cluster assistant. Format the command output into a clear, 
+        if endpoint == "list_pod_for_all_namespaces":
+            # For pod queries, only include pod name, namespace, and status
+            filtered_items = []
+            for item in response.get("items", []):
+                if "metadata" in item and "status" in item:
+                    filtered_items.append({
+                        "name": item["metadata"].get("name", ""),
+                        "namespace": item["metadata"].get("namespace", ""),
+                        "status": item["status"].get("phase", "")
+                    })
+            return {"items": filtered_items}
+        
+        # Add more endpoint-specific filters as needed
+        return response
+    except Exception as e:
+        logging.error(f"Error filtering API response: {str(e)}")
+        return response
+
+def process_response(query: str, endpoint: str, api_response: Dict[str, Any]) -> str:
+    """Process API response using GPT-4"""
+    try:
+        # Filter the response before sending to GPT-4
+        filtered_response = filter_api_response(endpoint, api_response, query)
+        
+        system_prompt = """You are a Kubernetes cluster assistant. Format the API response into a clear, 
         concise answer to the user's query. Keep answers factual and to the point. Only give the required answer in 1 or 2 words.
         Don't use sentence structure.
-        No need to write explanatory response. If the output indicates 
-        an error or doesn't contain relevant information, respond with "Information not available"."""
+        No need to write explanatory response. If the information is not available, respond with "Not available"."""
 
-        response = openai_client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Query: {query}\nCommand: {command}\nOutput: {output}"}
-            ],
-            temperature=0,
-            max_tokens=150
-        )
+        # Implement exponential backoff for retries
+        max_retries = 3
+        base_delay = 1
         
-        return response.choices[0].message.content.strip()
+        for attempt in range(max_retries):
+            try:
+                response = openai_client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Query: {query}\nEndpoint: {endpoint}\nResponse: {json.dumps(filtered_response)}"}
+                    ],
+                    temperature=0,
+                    max_tokens=50  # Reduced from 150 to 50
+                )
+                return response.choices[0].message.content.strip()
+            except openai.RateLimitError as e:
+                if attempt == max_retries - 1:
+                    raise
+                delay = (base_delay * 2 ** attempt) + random.uniform(0, 1)
+                logging.info(f"Rate limit hit, retrying in {delay} seconds...")
+                time.sleep(delay)
+            except Exception as e:
+                raise
+                
     except Exception as e:
-        logging.error(f"Error processing output: {str(e)}")
+        logging.error(f"Error processing response: {str(e)}")
         raise
 
 @app.route('/query', methods=['POST'])
@@ -127,25 +169,27 @@ def query_cluster():
 
         logging.info(f"Processing query: {query}")
         
-        # Get appropriate command for the query
-        command = get_appropriate_command(query)
-        logging.info(f"Selected command: {command}")
-        
-        # Execute the command
-        output, error = execute_kubectl_command(command)
-        if error:
-            logging.error(f"Command execution error: {error}")
-            return jsonify({"error": f"Command execution failed: {error}"}), 500
+        endpoint = get_appropriate_endpoint(query)
+        if endpoint == "not_available":
+            return jsonify({"error": "No appropriate API endpoint found for this query"}), 400
             
-        # Process the output
-        answer = process_output(query, command, output)
+        logging.info(f"Selected endpoint: {endpoint}")
         
-        response = QueryResponse(
-            query=query,
-            answer=answer,
-            command_used=command
-        )
-        return jsonify(response.dict())
+        try:
+            api_response = call_k8s_api(endpoint)
+            answer = process_response(query, endpoint, api_response)
+            
+            response = QueryResponse(
+                query=query,
+                answer=answer
+            )
+            return jsonify(response.dict())
+        except openai.RateLimitError as e:
+            logging.error(f"OpenAI rate limit exceeded: {str(e)}")
+            return jsonify({"error": "Service temporarily unavailable due to rate limiting. Please try again later."}), 429
+        except Exception as e:
+            logging.error(f"Error processing query: {str(e)}")
+            return jsonify({"error": str(e)}), 500
     
     except Exception as e:
         logging.error(f"Unexpected error: {str(e)}")
