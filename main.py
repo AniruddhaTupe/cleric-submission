@@ -12,7 +12,7 @@ import time
 import openai
 
 # Load environment variables
-load_dotenv()
+# load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, 
@@ -23,7 +23,9 @@ logging.basicConfig(level=logging.DEBUG,
 app = Flask(__name__)
 
 # Initialize OpenAI client
-openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+openai_client = OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY"),
+)
 
 # Initialize Kubernetes client
 try:
@@ -71,7 +73,7 @@ def get_appropriate_endpoint(query: str) -> str:
                 {"role": "user", "content": f"Available endpoints:\n{json.dumps(K8S_ENDPOINTS, indent=2)}\n\nQuery: {query}"}
             ],
             temperature=0,
-            max_tokens=50
+            max_tokens=150
         )
         
         return response.choices[0].message.content.strip()
@@ -146,7 +148,7 @@ def process_response(query: str, endpoint: str, api_response: Dict[str, Any]) ->
                         {"role": "user", "content": f"Query: {query}\nEndpoint: {endpoint}\nResponse: {json.dumps(filtered_response)}"}
                     ],
                     temperature=0,
-                    max_tokens=50  # Reduced from 150 to 50
+                    max_tokens=150  # Reduced from 150 to 50
                 )
                 return response.choices[0].message.content.strip()
             except openai.RateLimitError as e:
@@ -199,9 +201,9 @@ def create_query():
             logging.error(f"Error processing query: {str(e)}")
             return jsonify({"error": str(e)}), 500
     
-    # except Exception as e:
-    #     logging.error(f"Unexpected error: {str(e)}")
-    #     return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        logging.error(f"Unexpected error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
     except ValidationError as e:
         return jsonify({"error": e.errors()}), 400
 
