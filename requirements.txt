@@ -1,5 +1,7 @@
-requests
-Flask
-pydantic
-openai
-kubernetes
+Flask>=2.0.0
+requests>=2.25.0
+pydantic>=2.0.0
+kubernetes>=20.0.0
+openai>=1.0.0
+python-dotenv>=0.19.0
+typing-extensions>=4.0.0
