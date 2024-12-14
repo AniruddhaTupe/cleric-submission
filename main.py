@@ -2,7 +2,7 @@ import logging
 import os
 from typing import Optional, Dict, Any
 from flask import Flask, request, jsonify
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from openai import OpenAI
 from dotenv import load_dotenv
 from kubernetes import client, config
@@ -158,7 +158,7 @@ def process_response(query: str, endpoint: str, api_response: Dict[str, Any]) ->
         raise
 
 @app.route('/query', methods=['POST'])
-def query_cluster():
+def create_query():
     """Process a query about the cluster"""
     try:
         request_data = request.json
@@ -167,7 +167,7 @@ def query_cluster():
         if not query:
             return jsonify({"error": "Query is required"}), 400
 
-        logging.info(f"Processing query: {query}")
+        logging.info(f"Received query: {query}")
         
         endpoint = get_appropriate_endpoint(query)
         if endpoint == "not_available":
@@ -178,6 +178,9 @@ def query_cluster():
         try:
             api_response = call_k8s_api(endpoint)
             answer = process_response(query, endpoint, api_response)
+
+            # Log the answer
+            logging.info(f"Generated answer: {answer}")
             
             response = QueryResponse(
                 query=query,
@@ -191,9 +194,11 @@ def query_cluster():
             logging.error(f"Error processing query: {str(e)}")
             return jsonify({"error": str(e)}), 500
     
-    except Exception as e:
-        logging.error(f"Unexpected error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+    # except Exception as e:
+    #     logging.error(f"Unexpected error: {str(e)}")
+    #     return jsonify({"error": str(e)}), 500
+    except ValidationError as e:
+        return jsonify({"error": e.errors()}), 400
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
