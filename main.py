@@ -29,7 +29,9 @@ openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 try:
     config.load_incluster_config()  # Try to load in-cluster config
 except config.ConfigException:
-    config.load_kube_config()  # Fall back to local kube config
+    home = os.path.expanduser("~")
+    kubeconfig = os.path.join(home, '.kube', 'config')
+    config.load_kube_config(config_file=kubeconfig)  # Explicitly specify kubeconfig path
 
 # Create API clients
 v1 = client.CoreV1Api()
