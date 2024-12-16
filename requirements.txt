@@ -4,3 +4,9 @@ pydantic
 kubernetes
 chromadb
 openai
+llama-index
+torch
+sentence-transformers
+llama-index-embeddings-huggingface
+langchain-openai
+langchain-community

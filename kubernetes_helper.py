@@ -3,16 +3,27 @@ import subprocess
 import logging
 import os
 from openai import OpenAI
-import chromadb
-from typing import Dict, List
+from typing import Dict
+from pathlib import Path
+from llama_index.core import SimpleDirectoryReader
+from llama_index.core import VectorStoreIndex, ServiceContext, Settings
+from llama_index.llms.openai import OpenAI as LlamaOpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core import StorageContext
 
 # Get API key from environment and initialize OpenAI client
-client = OpenAI(api_key=os.environ.get('OPENAI_API_KEY'))
 if not os.environ.get('OPENAI_API_KEY'):
     raise ValueError("OPENAI_API_KEY environment variable is not set")
 
 class KubernetesHelper:
     def __init__(self):
+        # Initialize OpenAI settings
+        Settings.llm = LlamaOpenAI(model="gpt-4", temperature=0.3)
+        
+        # Initialize settings
+        Settings.embed_model = OpenAIEmbedding(model="text-embedding-ada-002")
+        Settings.chunk_size = 1024
+        
         self.commands = {
             "namespaces": "kubectl get namespaces -o json",
             "pods": "kubectl get pods --all-namespaces -o json",
@@ -25,38 +36,19 @@ class KubernetesHelper:
             "events": "kubectl get events --all-namespaces -o json"
         }
         
-        # Initialize ChromaDB
-        self.chroma_client = chromadb.Client()
-        self.collection = self.chroma_client.create_collection(
-            name="kubernetes_resources",
-            metadata={"description": "Kubernetes cluster resources"}
-        )
+        # Create k8s_data directory if it doesn't exist
+        self.data_dir = Path('k8s_data')
+        self.data_dir.mkdir(exist_ok=True)
+        self.index_path = 'k8s_index.json'
+        self.index = None
         
-    def get_embedding(self, text: str) -> List[float]:
-        """Get embeddings using OpenAI API"""
-        response = client.embeddings.create(
-            input=text,
-            model="text-embedding-ada-002"
-        )
-        return response.data[0].embedding
-    
     def refresh_cluster_data(self):
-        """Execute kubectl commands and store results in ChromaDB"""
+        """Execute kubectl commands and store results in JSON files"""
         logging.info("Starting cluster data refresh...")
         
         # Clear existing data
-        all_ids = self.collection.get()['ids']
-        if all_ids:
-            logging.info("Clearing existing data...")
-            self.collection.delete(ids=all_ids)
-        
-        documents = []
-        metadatas = []
-        ids = []
-        doc_id = 0
-        
-        # Batch size for ChromaDB insertions
-        BATCH_SIZE = 100
+        for file in self.data_dir.glob('*.json'):
+            file.unlink()
         
         for resource, command in self.commands.items():
             logging.info(f"Fetching {resource}...")
@@ -64,93 +56,90 @@ class KubernetesHelper:
                 result = subprocess.run(command.split(), capture_output=True, text=True)
                 if result.returncode == 0:
                     data = json.loads(result.stdout)
-                    if 'items' in data:
-                        for item in data['items']:
-                            doc = (f"Resource Type: {resource}\n"
-                                  f"Name: {item['metadata']['name']}\n"
-                                  f"Namespace: {item['metadata'].get('namespace', 'N/A')}\n"
-                                  f"Full Details: {json.dumps(item, indent=2)}")
-                            
-                            documents.append(doc)
-                            metadatas.append({
-                                "resource_type": resource,
-                                "name": item['metadata']['name'],
-                                "namespace": item['metadata'].get('namespace', 'N/A')
-                            })
-                            ids.append(f"doc_{doc_id}")
-                            doc_id += 1
-                            
-                            # Process in batches to avoid memory issues
-                            if len(documents) >= BATCH_SIZE:
-                                logging.info(f"Adding batch of {BATCH_SIZE} documents to ChromaDB...")
-                                self.collection.add(
-                                    documents=documents,
-                                    metadatas=metadatas,
-                                    ids=ids
-                                )
-                                documents = []
-                                metadatas = []
-                                ids = []
+                    
+                    # Log the content summary
+                    if resource == 'pods':
+                        if 'items' in data:
+                            pod_count = len(data['items'])
+                            logging.info(f"Found {pod_count} pods in the cluster")
+                            running_pods = sum(1 for pod in data['items'] 
+                                            if pod.get('status', {}).get('phase') == 'Running')
+                            logging.info(f"Of which {running_pods} pods are in Running state")
+                    
+                    # Save raw data
+                    file_path = self.data_dir / f"{resource}.json"
+                    with open(file_path, 'w') as f:
+                        json.dump(data, f, indent=2)
+                    
+                    logging.info(f"Saved {resource} data to {file_path}")
                 else:
                     logging.error(f"Error executing {command}: {result.stderr}")
             except Exception as e:
                 logging.error(f"Failed to execute {command}: {str(e)}")
         
-        # Add remaining documents
-        if documents:
-            logging.info(f"Adding final batch of {len(documents)} documents to ChromaDB...")
-            self.collection.add(
-                documents=documents,
-                metadatas=metadatas,
-                ids=ids
-            )
-        
-        logging.info("Cluster data refresh complete")
-        
-    def search_resources(self, query: str) -> str:
-        """Search through cluster data using semantic search"""
+        # Create index from the JSON files
         try:
-            # Query ChromaDB
-            results = self.collection.query(
-                query_texts=[query],
-                n_results=5
+            logging.info("Creating vector store index...")
+            documents = SimpleDirectoryReader(str(self.data_dir)).load_data()
+            storage_context = StorageContext.from_defaults()
+            self.index = VectorStoreIndex.from_documents(
+                documents,
+                storage_context=storage_context
+            )
+            # Save the index
+            storage_context.persist(persist_dir=self.index_path)
+            logging.info("Vector store index created and saved successfully")
+        except Exception as e:
+            logging.error(f"Failed to create index: {str(e)}")
+            raise
+                
+    def search_resources(self, query: str) -> str:
+        """Search through cluster data using LlamaIndex"""
+        try:
+            # Special handling for pod count query
+            if query.lower().strip() in ["how many pods are running in the cluster?", "how many pods are running?"]:
+                # Load and parse pods.json directly
+                pods_file = self.data_dir / "pods.json"
+                if pods_file.exists():
+                    with open(pods_file) as f:
+                        data = json.load(f)
+                        if 'items' in data:
+                            running_pods = sum(1 for pod in data['items'] 
+                                            if pod.get('status', {}).get('phase') == 'Running')
+                            return str(running_pods)
+            
+            # Regular vector search for other queries
+            if not self.index:
+                if os.path.exists(self.index_path):
+                    storage_context = StorageContext.from_defaults(persist_dir=self.index_path)
+                    self.index = VectorStoreIndex.from_storage(storage_context)
+                else:
+                    logging.error("No index found. Please refresh cluster data first.")
+                    return "Error: No cluster data available. Please refresh first."
+            
+            logging.info(f"Querying index with: {query}")
+            
+            system_prompt = """
+            You are a Kubernetes cluster information assistant. Follow these rules strictly:
+            1. For counting pods, return ONLY the number of pods where status.phase is "Running"
+            2. For pod names, remove the hash (e.g., 'snowflake-76b5665475-jzmwq' → 'snowflake')
+            3. For counts, return only the number without any text
+            4. For status queries, return only the status word
+            5. For namespace queries, list only the namespace names separated by commas
+            6. Never include explanations or additional context
+            7. Never use quotes or brackets in the response
+            """
+            
+            query_engine = self.index.as_query_engine(
+                system_prompt=system_prompt,
+                temperature=0.1
             )
             
-            if not results['documents'][0]:
-                return "No matching resources found"
+            response = query_engine.query(query)
+            answer = str(response).strip()
             
-            # Format the context from results
-            context = []
-            for doc, metadata in zip(results['documents'][0], results['metadatas'][0]):
-                context.append(doc)
-            
-            # Create prompt for OpenAI
-            prompt = f"""Based on the following Kubernetes cluster information and the user's query, 
-            provide a clear and concise answer. Focus only on relevant information.
-
-            User Query: {query}
-
-            Cluster Information:
-            {'\n'.join(context)}
-
-            Please provide a focused answer to the query using only the relevant information from above.
-            Keep the answers very short and precise. Give only one-word answers wherever possible.
-            Prioritize direct, factual responses.
-            When listing single items, return just the name without brackets or quotes.
-            If the answer is something like this - snowflake-76b5665475-jzmwq, return only snowflake."""
-
-            # Get response from OpenAI using new API syntax
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a Kubernetes cluster assistant. Provide clear, concise answers based on the cluster information provided."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=500
-            )
-            
-            return response.choices[0].message.content.strip()
+            logging.info(f"Generated answer: {answer}")
+            return answer
             
         except Exception as e:
             logging.error(f"Search error: {str(e)}")
