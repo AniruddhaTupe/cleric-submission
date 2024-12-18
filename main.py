@@ -65,11 +65,23 @@ class KubernetesQueryAgent:
 
             # Collect Pods with enhanced details
             all_pods = self.core_v1.list_pod_for_all_namespaces()
-            running_pods = [pod for pod in all_pods.items if pod.status.phase == "Running"]
-            cluster_info['running_pod_count'] = len(running_pods)
+            # Track both total and running pods
+            cluster_info['total_pod_count'] = len(all_pods.items)
+            cluster_info['running_pod_count'] = len([pod for pod in all_pods.items if pod.status.phase == "Running"])
+            
+            # Create pod status mapping
+            cluster_info['pod_status'] = {
+                pod.metadata.name.split('-')[0]: pod.status.phase 
+                for pod in all_pods.items
+            }
             
             for pod in all_pods.items:
-                pod_base_name = pod.metadata.name.split('-')[0]  # Extract base name without hash
+                # Extract base name and ensure consistent naming for special cases
+                pod_base_name = pod.metadata.name.split('-')[0]
+                
+                # Special handling for harbor-core
+                if 'harbor' in pod.metadata.name and 'core' in pod.metadata.name:
+                    pod_base_name = 'harbor-core'
                 
                 for container in pod.spec.containers:
                     container_details = {
@@ -80,20 +92,32 @@ class KubernetesQueryAgent:
                         'readiness_probe': None
                     }
 
-                    # Collect ports
+                    # Collect ports with more details
                     if container.ports:
                         container_details['ports'] = [
                             {
+                                'name': getattr(port, 'name', None),
                                 'container_port': port.container_port,
-                                'protocol': port.protocol
+                                'protocol': port.protocol,
+                                'host_port': getattr(port, 'host_port', None)
                             } for port in container.ports
                         ]
+                        # Store primary container port for quick access
+                        if container_details['ports']:
+                            container_details['primary_port'] = container_details['ports'][0]['container_port']
 
-                    # Collect environment variables
+                    # Collect environment variables with better handling
                     if container.env:
-                        container_details['env'] = {
-                            env.name: env.value for env in container.env if env.value
-                        }
+                        container_details['env'] = {}
+                        for env in container.env:
+                            if env.value is not None:
+                                container_details['env'][env.name] = env.value
+                            elif env.value_from:
+                                # Handle environment variables from various sources
+                                if env.value_from.config_map_key_ref:
+                                    container_details['env'][env.name] = f"configmap:{env.value_from.config_map_key_ref.key}"
+                                elif env.value_from.secret_key_ref:
+                                    container_details['env'][env.name] = f"secret:{env.value_from.secret_key_ref.key}"
 
                     # Collect readiness probe details
                     if container.readiness_probe and container.readiness_probe.http_get:
@@ -120,8 +144,11 @@ class KubernetesQueryAgent:
                 try:
                     services = self.core_v1.list_namespaced_service(namespace)
                     for svc in services.items:
-                        service_name = svc.metadata.name.lower()  # Normalize service names
+                        # Store both original and lowercase service names for better matching
+                        service_name = svc.metadata.name
+                        service_name_lower = service_name.lower()
                         cluster_info['service_to_namespace'][service_name] = namespace
+                        cluster_info['service_to_namespace'][service_name_lower] = namespace
                         
                         cluster_info['services'].append({
                             'name': svc.metadata.name,
@@ -137,6 +164,7 @@ class KubernetesQueryAgent:
                 except Exception as svc_err:
                     logging.warning(f"Error collecting services in namespace {namespace}: {svc_err}")
 
+            # Collect Deployments
             for namespace in [ns['name'] for ns in cluster_info['namespaces']]:
                 try:
                     deployments = self.apps_v1.list_namespaced_deployment(namespace)
@@ -158,7 +186,8 @@ class KubernetesQueryAgent:
                     ])
                 except Exception as dep_err:
                     logging.warning(f"Error collecting deployments in namespace {namespace}: {dep_err}")
-                    
+
+            # Collect Secrets
             for namespace in [ns['name'] for ns in cluster_info['namespaces']]:
                 try:
                     secrets = self.core_v1.list_namespaced_secret(namespace)
@@ -171,7 +200,6 @@ class KubernetesQueryAgent:
                     ])
                 except Exception as secret_err:
                     logging.warning(f"Error collecting secrets in namespace {namespace}: {secret_err}")
-
 
             return cluster_info
 
@@ -191,16 +219,26 @@ class KubernetesQueryAgent:
                         "role": "system", 
                         "content": """
                             You are a Kubernetes cluster information assistant. Follow these rules strictly:
-                            1. For counting pods, return ONLY the number from running_pod_count
-                            2. For pod names, use the base name without hash from the pods list
-                            3. For service namespace queries, use the service_to_namespace mapping
-                            4. For container ports, readiness probes, and env vars, check pod_details
-                            5. Return only the specific value requested without any additional text
-                            6. For namespace queries, return only the namespace name
-                            7. For status queries, return only the status word
-                            8. Never include explanations or additional context
-                            9. Never use quotes or brackets in the response
-                            10. For missing or not found data, return None
+                            1. For pod counts:
+                               - Use running_pod_count for running pods only
+                               - Use total_pod_count for all pods
+                            2. For Harbor service namespace:
+                               - Check service_to_namespace map using both "harbor" and "Harbor"
+                            3. For container ports:
+                               - Check pod_details[pod_name/container_name]['ports']
+                               - For harbor-core, use primary_port if available
+                            4. For readiness probes:
+                               - Extract path directly from pod_details[pod_name/container_name]['readiness_probe']['path']
+                            5. For environment variables:
+                               - Look up exact variable name in pod_details[pod_name/container_name]['env']
+                            6. Return values without any formatting:
+                               - No quotes, brackets, or explanatory text
+                               - For missing data, return None
+                               - For numeric values, return just the number
+                               - For paths, return just the path
+                            7. Special handling for Harbor components:
+                               - Use exact matches for harbor-core
+                               - Check both original and lowercase names
                             """
                     },
                     {
@@ -220,22 +258,14 @@ kubernetes_query_agent = KubernetesQueryAgent()
 @app.route('/query', methods=['POST'])
 def create_query():
     try:
-        # Extract the question from the request data
         request_data = request.json
         query = request_data.get('query')
-        
-        # Log the question
         logging.info(f"Received query: {query}")
         
-        # Generate answer using the Kubernetes query agent
         answer = kubernetes_query_agent.query_openai(query)
-        
-        # Log the answer
         logging.info(f"Generated answer: {answer}")
         
-        # Create the response model
         response = QueryResponse(query=query, answer=answer)
-        
         return jsonify(response.dict())
     
     except ValidationError as e:
