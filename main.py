@@ -5,6 +5,7 @@ from flask import Flask, request, jsonify
 from pydantic import BaseModel, ValidationError
 from kubernetes import client, config
 from openai import OpenAI
+import base64
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, 
@@ -45,12 +46,15 @@ class KubernetesQueryAgent:
         cluster_info = {
             'namespaces': [],
             'running_pod_count': 0,
+            'total_pod_count': 0,
             'deployments': [],
             'services': [],
             'secrets': [],
             'pods': [],
-            'service_to_namespace': {},  # New mapping for service locations
-            'pod_details': {}  # New mapping for detailed pod information
+            'service_to_namespace': {},
+            'pod_details': {},
+            'volume_mounts': {},  # New mapping for volume mount information
+            'pod_env_vars': {}    # New mapping for environment variables
         }
 
         try:
@@ -89,35 +93,66 @@ class KubernetesQueryAgent:
                         'image': container.image,
                         'ports': [],
                         'env': {},
-                        'readiness_probe': None
+                        'readiness_probe': None,
+                        'volume_mounts': []
                     }
 
-                    # Collect ports with more details
-                    if container.ports:
-                        container_details['ports'] = [
-                            {
-                                'name': getattr(port, 'name', None),
-                                'container_port': port.container_port,
-                                'protocol': port.protocol,
-                                'host_port': getattr(port, 'host_port', None)
-                            } for port in container.ports
-                        ]
-                        # Store primary container port for quick access
-                        if container_details['ports']:
-                            container_details['primary_port'] = container_details['ports'][0]['container_port']
+                    # Collect volume mounts with complete details
+                    if container.volume_mounts:
+                        for mount in container.volume_mounts:
+                            mount_details = {
+                                'name': mount.name,
+                                'mount_path': mount.mount_path,
+                                'sub_path': mount.sub_path if hasattr(mount, 'sub_path') else None,
+                                'read_only': mount.read_only if hasattr(mount, 'read_only') else False
+                            }
+                            container_details['volume_mounts'].append(mount_details)
+                            
+                            # Map volume mounts to persistent volumes
+                            if pod.spec.volumes:
+                                for volume in pod.spec.volumes:
+                                    if volume.name == mount.name and volume.persistent_volume_claim:
+                                        volume_key = f"{pod_base_name}/{container.name}/{mount.name}"
+                                        cluster_info['volume_mounts'][volume_key] = mount_details
+                                        # Store direct mapping for database volume
+                                        if 'database' in container.name.lower() or 'db' in container.name.lower():
+                                            cluster_info['volume_mounts'][f"{pod_base_name}_db"] = mount_details
 
-                    # Collect environment variables with better handling
+                    # Enhanced environment variable collection
                     if container.env:
-                        container_details['env'] = {}
                         for env in container.env:
+                            env_value = None
                             if env.value is not None:
-                                container_details['env'][env.name] = env.value
+                                env_value = env.value
                             elif env.value_from:
-                                # Handle environment variables from various sources
                                 if env.value_from.config_map_key_ref:
-                                    container_details['env'][env.name] = f"configmap:{env.value_from.config_map_key_ref.key}"
+                                    try:
+                                        config_map = self.core_v1.read_namespaced_config_map(
+                                            name=env.value_from.config_map_key_ref.name,
+                                            namespace=pod.metadata.namespace
+                                        )
+                                        env_value = config_map.data.get(env.value_from.config_map_key_ref.key)
+                                    except Exception as e:
+                                        logging.warning(f"Error reading ConfigMap for env var {env.name}: {e}")
                                 elif env.value_from.secret_key_ref:
-                                    container_details['env'][env.name] = f"secret:{env.value_from.secret_key_ref.key}"
+                                    try:
+                                        secret = self.core_v1.read_namespaced_secret(
+                                            name=env.value_from.secret_key_ref.name,
+                                            namespace=pod.metadata.namespace
+                                        )
+                                        if env.value_from.secret_key_ref.key in secret.data:
+                                            # Decode base64 secret value
+                                            env_value = base64.b64decode(
+                                                secret.data[env.value_from.secret_key_ref.key]
+                                            ).decode('utf-8')
+                                    except Exception as e:
+                                        logging.warning(f"Error reading Secret for env var {env.name}: {e}")
+                            
+                            if env_value is not None:
+                                container_details['env'][env.name] = env_value
+                                # Store in pod_env_vars for direct access
+                                env_key = f"{pod_base_name}/{container.name}/{env.name}"
+                                cluster_info['pod_env_vars'][env_key] = env_value
 
                     # Collect readiness probe details
                     if container.readiness_probe and container.readiness_probe.http_get:
@@ -230,14 +265,18 @@ class KubernetesQueryAgent:
                             4. For readiness probes:
                                - Extract path directly from pod_details[pod_name/container_name]['readiness_probe']['path']
                             5. For environment variables:
-                               - Look up exact variable name in pod_details[pod_name/container_name]['env']
-                            6. Return values without any formatting:
+                               - First check pod_env_vars using format "pod_name/container_name/env_name"
+                               - Then check pod_details[pod_name/container_name]['env'][env_name]
+                            6. For volume mounts:
+                               - For database volumes, check volume_mounts["pod_name_db"]
+                               - Otherwise check volume_mounts using format "pod_name/container_name/volume_name"
+                            7. Return values without any formatting:
                                - No quotes, brackets, or explanatory text
                                - For missing data, return None
                                - For numeric values, return just the number
                                - For paths, return just the path
-                            7. Special handling for Harbor components:
-                               - Use exact matches for harbor-core
+                            8. Special handling for Harbor components:
+                               - Use exact matches for harbor-core and harbor-database
                                - Check both original and lowercase names
                             """
                     },
