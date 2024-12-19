@@ -97,6 +97,20 @@ class KubernetesQueryAgent:
                         'volume_mounts': []
                     }
 
+                     # Collect ports with more details
+                    if container.ports:
+                        container_details['ports'] = [
+                            {
+                                'name': getattr(port, 'name', None),
+                                'container_port': port.container_port,
+                                'protocol': port.protocol,
+                                'host_port': getattr(port, 'host_port', None)
+                            } for port in container.ports
+                        ]
+                        # Store primary container port for quick access
+                        if container_details['ports']:
+                            container_details['primary_port'] = container_details['ports'][0]['container_port']
+
                     # Collect volume mounts with complete details
                     if container.volume_mounts:
                         for mount in container.volume_mounts:
