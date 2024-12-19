@@ -1,72 +1,97 @@
-# cleric-submission
-
-# Kubernetes Query and Analysis Service
+# Kubernetes Query Agent
 
 ## Overview
 
-This project is a Flask-based web application designed to interact with a Kubernetes cluster, retrieve its resources, and provide detailed insights to users based on their queries. It combines the Kubernetes Python client for cluster operations with OpenAI's API to deliver intelligent and concise responses tailored to the cluster's current state.
+The Kubernetes Query Agent is an intelligent, AI-powered tool designed to provide comprehensive insights into your Kubernetes cluster. By leveraging the power of OpenAI's GPT-4 and the Kubernetes Python client, this agent collects detailed cluster information and generates precise, context-aware responses to user queries.
 
-## Approach
+## Key Features
 
-This is a natural language interface for Kubernetes cluster management that follows a three-step process:
+- **Comprehensive Cluster Scanning**: 
+  - Automatically collects detailed information across all namespaces
+  - Captures rich metadata about pods, deployments, services, and secrets
+  - Provides a 360-degree view of your Kubernetes cluster
 
-1. **Query Translation**:
-   - Translates natural language queries into kubectl commands.
-   - Executes the command and retrieves the output.
+- **AI-Powered Querying**:
+  - Uses OpenAI's GPT-4 to interpret complex queries
+  - Generates accurate, context-based responses
+  - Handles a wide range of cluster-related questions
 
-2. **Command Execution**:
-   - Executes the kubectl command and retrieves the output.
+- **Flexible and Adaptable**:
+  - Works across different cluster configurations
+  - No hard-coded assumptions about service names or structures
+  - Easily extensible for various Kubernetes environments
 
-3. **Response Formatting**:
-   - Formats the kubectl output into a concise, user-friendly response using GPT-4.
+## How It Works
 
-4. **Robust Error Handling**:
-   - Logs errors and unexpected events to ensure system stability.
-   - Captures issues with Kubernetes configuration, API calls, and OpenAI processing.
+1. **Information Collection**
+   - Scans entire Kubernetes cluster using the Kubernetes Python client
+   - Gathers comprehensive information about:
+     * Namespaces
+     * Pods (status, containers, ports, environment variables)
+     * Deployments
+     * Services
+     * Secrets
 
+2. **AI-Powered Query Processing**
+   - Sends complete cluster context to OpenAI's GPT-4
+   - AI interprets the context and user query
+   - Generates precise, contextually relevant answers
 
-## Setup and Usage
+## Prerequisites
 
-### Prerequisites
-- Python 3.x
-- Kubernetes cluster with access to kubeconfig
-- OpenAI API key
+- Python 3.10+
+- Kubernetes cluster
+- OpenAI API Key
+- Kubernetes configuration file (`~/.kube/config`)
 
-### Installation
-1. Clone the Repository:
-```
-git clone <repository-url>
-cd <repository-dir>
-```
+## Installation
 
-2. Install Dependencies:
-```
-pip install -r requirements.txt
-```
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/your-username/kubernetes-query-agent.git
+   cd kubernetes-query-agent
+   ```
 
-3. Set Environment Variables: Configure the OpenAI API key:
-```
-export OPENAI_API_KEY='your_openai_api_key'
-```
+2. Create and activate a virtual environment (optional but recommended):
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
+   ```
 
-### Running the Application
+3. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-Start the Flask application:
-```
+4. Set up OpenAI API Key:
+   ```bash
+   export OPENAI_API_KEY=your_openai_api_key
+   ```
+
+## Usage
+
+Start the Flask server:
+```bash
 python main.py
 ```
-The service will run on `http://127.0.0.1:8000`.
 
-### API Usage
-Send POST requests to the `/query` endpoint with your query in JSON format. 
-For example:
-```
+Send queries via POST request to `http://localhost:8000/query`:
+
+### Example Query
+```bash
 curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"query": "How many pods are running?"}'
-
+     -H "Content-Type: application/json" \
+     -d '{"query": "How many pods are in the default namespace?"}'
 ```
 
-## Logs
-Operational logs are stored in `agent.log` for tracking queries, responses, and errors.
+### Supported Query Types
+- Namespace information
+- Pod counts and details
+- Deployment status
+- Service configurations
+- Secret information
+- Resource-specific queries
 
+## Logging
+
+All queries and interactions are logged in `agent.log` for debugging and tracking purposes.
